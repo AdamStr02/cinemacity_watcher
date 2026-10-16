@@ -1,0 +1,106 @@
+name: Cinema City watchdog (řetěz)
+
+# Samospouštěcí řetěz místo cronu (ten se v tomhle repu nerozjel).
+# Jeden běh hlídá rozpis zhruba každých 15 minut po dobu ~5,5 hodiny a na konci
+# spustí svého nástupce. workflow_dispatch přes vestavěný GITHUB_TOKEN GitHub
+# výjimečně dovoluje, takže není potřeba žádný osobní token.
+#
+# Když řetěz spadne (v Actions nic neběží ani nečeká), stačí ho nakopnout
+# ručně přes "Run workflow".
+on:
+  workflow_dispatch:
+    inputs:
+      force_report:
+        description: "Při první kontrole nahlásit všechny aktuální termíny"
+        type: boolean
+        default: false
+
+# Vlastní skupina, aby se řetěz nepletl s původním watch.yml.
+# Drží řetěz jen jeden: další běh čeká, dokud aktuální nedoběhne, a novější
+# čekající běh zruší staršího (třeba ruční spuštění během běžícího řetězu).
+concurrency:
+  group: watchdog-chain
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # commit stavu
+  issues: write     # hlášení nových termínů
+  actions: write    # spuštění dalšího běhu
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # limit GitHubu je 360, smyčka končí po ~335
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Hlídat rozpis
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FILM_PATTERN: duna
+          AUDITORIUM_PATTERN: imax
+          FORCE: ${{ inputs.force_report && '--force-report' || '' }}
+          INTERVAL: "900"    # 15 minut mezi kontrolami
+          RUN_FOR: "19800"   # 5,5 hodiny, pak předá štafetu dalšímu běhu
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          end=$(( $(date +%s) + RUN_FOR ))
+
+          while :; do
+            echo "::group::Kontrola $(date -u '+%Y-%m-%d %H:%M UTC')"
+            rm -f report.md title.txt
+
+            if python3 watch.py --state state/seen.json --report report.md --title title.txt $FORCE; then
+              if [ -f report.md ]; then
+                # Přiřazení vlastníkovi = e-mail; issue hned zavřeme, slouží jen k doručení.
+                if url=$(gh issue create --title "$(cat title.txt)" --body-file report.md \
+                           --assignee "$GITHUB_REPOSITORY_OWNER"); then
+                  echo "Založeno: $url"
+                  gh issue close "$url" --reason completed || true
+                else
+                  # Nepovedlo se nahlásit -> stav neukládáme, ať se to zkusí příště znovu.
+                  echo "::warning::Issue se nepodařilo založit, zkusím to při další kontrole."
+                  git checkout -- state/seen.json
+                fi
+              fi
+            else
+              echo "::warning::Kontrola selhala, zkusím to při další kontrole."
+            fi
+            FORCE=""   # force_report platí jen pro první kontrolu
+
+            if ! git diff --quiet -- state/seen.json; then
+              git add state/seen.json
+              git commit -q -m "Aktualizace stavu rozpisu ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+              pushed=""
+              for i in 1 2 3; do
+                if git pull --rebase -q origin "$GITHUB_REF_NAME" && git push -q; then
+                  pushed=1; break
+                fi
+                git rebase --abort 2>/dev/null || true
+                sleep 5
+              done
+              if [ -z "$pushed" ]; then
+                # Stav mezitím změnil jiný běh (třeba původní watch.yml).
+                # Srovnáme se se vzdálenou verzí; případná novinka se nahlásí
+                # znovu při další kontrole (v nejhorším přijde e-mail dvakrát).
+                echo "::warning::Stav se nepodařilo pushnout, srovnávám se s origin."
+                git fetch -q origin "$GITHUB_REF_NAME"
+                git reset -q --hard "origin/$GITHUB_REF_NAME"
+              fi
+            fi
+            echo "::endgroup::"
+
+            [ $(( $(date +%s) + INTERVAL )) -lt "$end" ] || break
+            sleep "$INTERVAL"
+          done
+
+      - name: Spustit další běh
+        if: always()   # i když něco výš spadlo, ať se řetěz nepřetrhne
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run watch-chain.yml --ref "$GITHUB_REF_NAME"
