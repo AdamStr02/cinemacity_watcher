@@ -2,7 +2,7 @@
 
 Hlídá rozpis [Cinema City](https://www.cinemacity.cz) a když přibude nový termín
 **Duny v IMAXu**, založí v tomhle repu issue a **přiřadí ho vlastníkovi repa**.
-GitHub z něj pošle e-mail i push do mobilní appky.
+GitHub z něj pošle e-mail i push do mobilní appky. 
 
 Na přiřazení záleží: e-mail chodí ve výchozím nastavení jen u „Participating"
 notifikací (přiřazení, zmínky, odpovědi). Pouhé sledování repa („Watching")
